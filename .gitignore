@@ -1,2 +1,5 @@
 .vscode/
 credentials.json
+.env
+__pycache__/
+.venv/
