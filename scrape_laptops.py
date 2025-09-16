@@ -1,8 +1,9 @@
 import argparse
 import csv
+import json
 import sys
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -14,6 +15,20 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 URL = "https://webscraper.io/test-sites/e-commerce/allinone/computers/laptops"
+
+# When you want to run the script without passing any command-line arguments,
+# edit these values. If the script is invoked with arguments, they override
+# these defaults via argparse. If invoked with no arguments, these are used.
+CONFIG_DEFAULTS = {
+    "max": 100,
+    "out": "laptops.csv",
+    "no_headless": False,
+    "tsv": False,
+    "deep": True,
+    "sheet_id": "12QpdYmm5QrLfWlLxcst06H_MRQCTekUdNKgu-QhX_w0",
+    "sheet_tab": "Sheet1",
+    "gcp_creds": "credentials.json",
+}
 
 
 @dataclass
@@ -49,6 +64,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--no-headless", action="store_true", help="Run browser non-headless")
     parser.add_argument("--tsv", action="store_true", help="Write tab-separated output instead of CSV")
     parser.add_argument("--deep", action="store_true", help="Open each product page and scrape details from there")
+    parser.add_argument("--sheet-id", type=str, help="Google Sheet ID to write results (optional)")
+    parser.add_argument("--sheet-tab", type=str, default="Sheet1", help="Worksheet title (default Sheet1)")
+    parser.add_argument(
+        "--gcp-creds",
+        type=str,
+        help="Path to a Google service account JSON credentials file (or inline JSON string).",
+    )
     return parser.parse_args(argv)
 
 
@@ -160,18 +182,89 @@ def scrape_products(driver: webdriver.Chrome, max_items: int, deep: bool = False
 
 
 def main(argv: List[str]) -> int:
-    args = parse_args(argv)
+    # If any argv provided, use argparse (explicit override). Otherwise build args from CONFIG_DEFAULTS.
+    if argv:
+        args = parse_args(argv)
+    else:
+        class _Args:  # lightweight object to mimic argparse namespace
+            pass
+        args = _Args()
+        for k, v in CONFIG_DEFAULTS.items():
+            setattr(args, k, v)
     driver = build_driver(headless=not args.no_headless)
     try:
         driver.get(URL)
         products = scrape_products(driver, args.max, deep=getattr(args, "deep", False))
         delimiter = "\t" if getattr(args, "tsv", False) else ","
         write_csv(products, args.out, delimiter=delimiter)
+        if args.sheet_id and args.gcp_creds:
+            try:
+                write_google_sheet(products, args.sheet_id, args.sheet_tab, args.gcp_creds)
+                print(f"Uploaded {len(products)} rows to Google Sheet {args.sheet_id} / {args.sheet_tab}")
+            except Exception as e:
+                print(f"Failed to write Google Sheet: {e}", file=sys.stderr)
         for p in products:
             print(f"{p.price}\t{p.name}\t{p.description}")
         return 0
     finally:
         driver.quit()
+
+
+def _load_creds(creds_arg: str):
+    # creds_arg can be a file path or a JSON string
+    try:
+        # Try treat as path
+        with open(creds_arg, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        # Fall back to inline JSON string
+        return json.loads(creds_arg)
+
+
+def write_google_sheet(products: List[Product], sheet_id: str, sheet_tab: str, creds_arg: str) -> None:
+    import gspread  # imported lazily to avoid requirement if unused
+    from google.oauth2.service_account import Credentials
+
+    data = _load_creds(creds_arg)
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_info(data, scopes=scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(sheet_id)
+    try:
+        worksheet = sheet.worksheet(sheet_tab)
+    except Exception:
+        # Create with enough rows + buffer
+        worksheet = sheet.add_worksheet(title=sheet_tab, rows=str(len(products) + 20), cols="5")
+    rows = [["Name", "Price", "Description"]] + [
+        [p.name, p.price, p.description] for p in products
+    ]
+    needed_rows = len(rows)
+    try:
+        current_rows = worksheet.row_count
+        if current_rows < needed_rows:
+            worksheet.resize(rows=needed_rows)
+    except Exception as e:
+        print(f"Could not resize worksheet: {e}", file=sys.stderr)
+    # Clear sheet before updating for deterministic content
+    try:
+        worksheet.clear()
+    except Exception as e:
+        print(f"Warning: could not clear worksheet: {e}", file=sys.stderr)
+    # Use A1 update to avoid size inference issues
+    try:
+        worksheet.update("A1", rows, value_input_option="RAW")
+    except Exception as e:
+        raise RuntimeError(f"Worksheet update failed: {e}")
+    # Simple post-condition check
+    try:
+        fetched_first_row = worksheet.row_values(1)
+        if fetched_first_row[:3] != ["name", "price", "description"]:
+            print("Warning: header row mismatch after update.", file=sys.stderr)
+    except Exception as e:
+        print(f"Post-update verification failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
